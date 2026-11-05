@@ -6,31 +6,39 @@ and download a translated PDF where every picture stays exactly where it was.
 ## How it works
 
 ```
-PDF ──► PyMuPDF extracts text blocks + positions (images untouched)
-            │
-            ▼
-   ┌─ Analyzer agent ─┐  reads the document: genre, tone, audience,
-   │                  │  style guide, glossary of names
-   └────────┬─────────┘
-            ▼
-   ┌─ Translator agent ┐  page by page, using the brief + previous page
-   │                   │  → translates meaning, idioms, rhyme, not words
-   └────────┬──────────┘
-            ▼
-   ┌─ Reviewer agent ──┐  native-editor pass that fixes awkward/literal lines
-   └────────┬──────────┘  (optional toggle)
-            ▼
-PyMuPDF erases ONLY the original text and writes the translation into the
-same boxes with the right Noto font  ──►  translated PDF (images in place)
+PDF (typed, scanned, photographed, handwritten, any font or language)
+  │
+  ▼  for every page, pick the best way to read it:
+  ├─ TEXT mode   clean digital text → read directly (free, no API call)
+  │              pictures are cropped with the old text removed
+  └─ VISION mode scans, photos, handwriting, garbled/legacy font encodings
+                 (Bamini, Kruti Dev…), multi-column pages, tables, charts
+                 → Reader agent (Gemini vision) transcribes the page and
+                   marks where every picture is
+  │
+  ▼
+Analyzer agent    genre, tone, audience, style guide, glossary of names
+  ▼
+Translator agent  translates meaning, idioms, rhyme (batches across pages)
+  ▼
+Reviewer agent    native-editor pass (optional)
+  ▼
+Rebuild           a clean PDF, page by page, same page size; each picture sits
+                  between the same paragraphs as in the original. Longer
+                  translations flow onto an extra page instead of shrinking.
 ```
+
+After converting, the app lists which pages were read with AI vision and why,
+so users know which pages (especially handwriting) to double-check.
 
 | File | Purpose |
 |---|---|
-| `app.py` | Streamlit UI (upload, language dropdown, Convert, Download, preview) |
-| `agents.py` | The 3 agents + free LLM client with rate-limit retry |
-| `pipeline.py` | PDF read → agents → write back in place |
-| `languages.py` | Dropdown languages and the font each needs |
-| `fonts.py` | Downloads the free Noto font on first use |
+| `app.py` | Streamlit UI: upload, language, password box (only if needed), Convert with loading screen, Download |
+| `agents.py` | Reader (vision), Analyzer, Translator, Reviewer agents + free LLM client |
+| `extract.py` | Garbled-text detector, per-page routing, text & vision readers |
+| `render.py` | Rebuilds the translated PDF with pictures in context |
+| `pipeline.py` | Runs the whole job: read → analyze → translate → review → rebuild |
+| `languages.py` / `fonts.py` | Dropdown languages and their free Noto fonts |
 
 ## Which model, and why
 
@@ -137,11 +145,16 @@ Streamlit template, upload these files, add the key under *Settings → Secrets*
 
 ## Limits & tips
 
-- **Scanned PDFs** (text is part of a photo) have no selectable text. OCR them
-  first, e.g. free `ocrmypdf input.pdf output.pdf`, then upload the result.
-- Translations are usually longer than the source; text is auto-shrunk to fit
-  its original box so the layout never breaks.
-- Text drawn *inside* a picture (part of the image pixels) can't be translated.
-- Original decorative fonts are replaced by clean Noto fonts for the target
-  script (the original fonts don't contain Tamil/Japanese/etc. letters).
+- **Scanned and handwritten pages need the Gemini key.** They are read with
+  Gemini's vision ability; Groq's vision models are a weaker fallback.
+- Each vision page costs 1 request on top of translation. Free-tier daily
+  limits apply, so for very large scanned books turn the Reviewer off
+  (`REVIEWER = "false"` in secrets) to halve the translation requests.
+- Messy handwriting can be misread; unreadable words are marked `[?]` for the
+  translator, and the app tells you which pages were read this way.
+- Text that is part of a picture (words painted into an illustration, a
+  poster photo) stays inside the picture untranslated.
+- The output is a clean re-typeset PDF: original decorative fonts, coloured
+  backgrounds and exact positions are replaced by a readable layout, while
+  every picture stays in its place in the flow and page order is kept.
 - Add a language: add a line in `languages.py` with a Noto font name.

@@ -1,167 +1,172 @@
-"""Reads the PDF, runs the agents, and writes translated text back in place.
-
-How images stay in the same place: we never rebuild the PDF. We open the
-original, erase only the text (redaction with images and drawings kept), then
-write the translated text into the exact same boxes. Pictures, backgrounds,
-borders and page size are untouched.
-"""
-import html
+"""Orchestrates the whole job: read -> analyze -> translate -> review -> rebuild."""
+import time
 from typing import Callable
 
 import pymupdf as fitz
 
-from agents import LLM, AnalyzerAgent, ReviewerAgent, TranslatorAgent
+from agents import LLM, log, AnalyzerAgent, ReaderAgent, ReviewerAgent, TranslatorAgent
+from extract import choose_mode, read_text_page, read_vision_page
 from fonts import ensure_fonts
-from languages import LANGUAGES
+from languages import LANGUAGES, LATIN
+from render import build_pdf
 
-MAX_CHARS_PER_CALL = 5000  # keeps each request well inside free-tier limits
-
-
-# ------------------------------------------------------------------ extract
-
-def extract_blocks(page: fitz.Page, page_no: int) -> list[dict]:
-    blocks = []
-    for i, b in enumerate(page.get_text("dict")["blocks"]):
-        if b["type"] != 0:
-            continue  # type 1 = image, leave alone
-        lines, spans = [], []
-        for line in b["lines"]:
-            if abs(line["dir"][1]) > 0.1:
-                continue  # skip rotated/vertical text
-            text = "".join(s["text"] for s in line["spans"]).strip()
-            if text:
-                lines.append(text)
-                spans.extend(s for s in line["spans"] if s["text"].strip())
-        if not lines:
-            continue
-        main = max(spans, key=lambda s: len(s["text"]))  # dominant style
-        blocks.append({
-            "id": f"p{page_no}b{i}",
-            "bbox": fitz.Rect(b["bbox"]),
-            "text": "\n".join(lines),
-            "size": round(main["size"], 1),
-            "color": f"#{main['color']:06x}",
-            "bold": bool(main["flags"] & 16),
-            "italic": bool(main["flags"] & 2),
-            "align": _guess_align(b, page.rect.width),
-        })
-    return blocks
+MAX_CHARS_PER_CALL = 5000  # one request translates this much text (across pages)
 
 
-def _guess_align(block: dict, page_width: float) -> str:
-    lines = [l for l in block["lines"] if "".join(s["text"] for s in l["spans"]).strip()]
-    lefts = [l["bbox"][0] for l in lines]
-    centres = [(l["bbox"][0] + l["bbox"][2]) / 2 for l in lines]
-    if len(lines) > 1:
-        if max(lefts) - min(lefts) < 3:
-            return "left"
-        return "center" if max(centres) - min(centres) < 4 else "left"
-    x0, _, x1, _ = block["bbox"]
-    near_middle = abs((x0 + x1) / 2 - page_width / 2) < page_width * 0.03
-    return "center" if near_middle and (x1 - x0) < page_width * 0.6 else "left"
+def open_pdf(pdf_bytes: bytes, password: str = "") -> fitz.Document:
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        raise ValueError("This file could not be opened as a PDF (it may be damaged).")
+    if doc.needs_pass and not doc.authenticate(password or ""):
+        raise ValueError("This PDF is password protected. Enter the correct password.")
+    return doc
 
 
-def _batches(blocks: list[dict]):
+def needs_password(pdf_bytes: bytes) -> bool:
+    try:
+        return fitz.open(stream=pdf_bytes, filetype="pdf").needs_pass
+    except Exception:
+        return False
+
+
+def _units(pages: list[dict]) -> list[dict]:
+    """Flattens all translatable text into units with stable ids."""
+    units = []
+    for p, page in enumerate(pages):
+        for e, el in enumerate(page["elements"]):
+            if el["kind"] == "table":
+                for r, row in enumerate(el["rows"]):
+                    for c, cell in enumerate(row):
+                        if any(ch.isalpha() for ch in cell):
+                            units.append({"id": f"p{p}e{e}r{r}c{c}", "kind": "cell", "text": cell})
+            elif el["kind"] != "image" and any(ch.isalpha() for ch in el["text"]):
+                units.append({"id": f"p{p}e{e}", "kind": el["kind"], "text": el["text"]})
+    return units
+
+
+def _batches(units: list[dict]):
     batch, size = [], 0
-    for b in blocks:
-        if batch and size + len(b["text"]) > MAX_CHARS_PER_CALL:
+    for u in units:
+        if batch and size + len(u["text"]) > MAX_CHARS_PER_CALL:
             yield batch
             batch, size = [], 0
-        batch.append(b)
-        size += len(b["text"])
+        batch.append(u)
+        size += len(u["text"])
     if batch:
         yield batch
 
 
-def _worth_translating(text: str) -> bool:
-    return any(ch.isalpha() for ch in text)
+def _apply(pages: list[dict], translations: dict) -> None:
+    for p, page in enumerate(pages):
+        for e, el in enumerate(page["elements"]):
+            if el["kind"] == "table":
+                el["rows"] = [[translations.get(f"p{p}e{e}r{r}c{c}", cell) for c, cell in enumerate(row)]
+                              for r, row in enumerate(el["rows"])]
+            elif el["kind"] != "image":
+                el["text"] = translations.get(f"p{p}e{e}", el["text"])
 
-
-# ------------------------------------------------------------------ write back
-
-def write_page(page: fitz.Page, blocks: list[dict], translations: dict,
-               css: str, archive: fitz.Archive, rtl: bool) -> None:
-    todo = [b for b in blocks if translations.get(b["id"])]
-    if not todo:
-        return
-    for b in todo:
-        # fill=False: erase the text but keep whatever is behind it (pictures!)
-        page.add_redact_annot(b["bbox"], fill=False)
-    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
-                          graphics=fitz.PDF_REDACT_LINE_ART_NONE)
-
-    for b in todo:
-        text = html.escape(translations[b["id"]].strip()).replace("\n", "<br>")
-        style = (
-            f"font-family: target, latin; font-size: {b['size']}pt; color: {b['color']};"
-            f"font-weight: {'bold' if b['bold'] else 'normal'};"
-            f"font-style: {'italic' if b['italic'] else 'normal'};"
-            f"text-align: {'right' if rtl and b['align'] == 'left' else b['align']};"
-            "line-height: 1.25;"
-        )
-        direction = ' dir="rtl"' if rtl else ""
-        # translations are often longer: give the box a little extra room,
-        # and let insert_htmlbox shrink the font if it still doesn't fit.
-        r = b["bbox"]
-        rect = fitz.Rect(r.x0, r.y0, r.x1, min(r.y1 + r.height * 0.15, page.rect.y1))
-        if b["align"] == "center":  # centred titles/poems can widen symmetrically
-            grow = min(r.width * 0.25, r.x0 - 36, page.rect.x1 - 36 - r.x1)
-            if grow > 0:
-                rect.x0, rect.x1 = r.x0 - grow, r.x1 + grow
-        page.insert_htmlbox(rect, f'<div{direction} style="{style}">{text}</div>',
-                            css=css, archive=archive, scale_low=0)
-
-
-# ------------------------------------------------------------------ orchestrate
 
 def translate_pdf(pdf_bytes: bytes, target: str, llm: LLM, review: bool = True,
-                  progress: Callable[[float, str], None] = lambda p, m: None) -> tuple[bytes, dict]:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    rtl = LANGUAGES[target].get("rtl", False)
+                  password: str = "",
+                  progress: Callable[[float, str], None] = lambda p, m: None
+                  ) -> tuple[bytes, dict, list[str]]:
+    """Returns (translated pdf, analyzer brief, notes for the user)."""
+    started, last = time.time(), {"p": 0.0}
+    report = progress
 
-    progress(0.02, f"Downloading {target} font (first time only)...")
-    font_dir, css = ensure_fonts(target)
-    archive = fitz.Archive(str(font_dir))
+    def progress(p: float, msg: str) -> None:  # remember where we are for wait messages
+        last["p"] = p
+        report(p, msg)
 
-    pages = [extract_blocks(page, n) for n, page in enumerate(doc)]
-    all_text = "\n".join(b["text"] for blocks in pages for b in blocks)
-    if not all_text.strip():
-        raise ValueError(
-            "No selectable text found. This looks like a scanned PDF (text is part "
-            "of the image). Run it through OCR first, e.g. `ocrmypdf in.pdf out.pdf`."
-        )
+    llm.on_wait = lambda msg: report(last["p"], msg)
+    doc = open_pdf(pdf_bytes, password)
+    clean = open_pdf(pdf_bytes, password)  # copy used to crop pictures without text
+    total = len(doc)
+    if total == 0:
+        raise ValueError("This PDF has no pages.")
 
-    progress(0.05, "Analyzer agent: understanding the document...")
-    brief = AnalyzerAgent(llm).run(all_text, target)
+    progress(0.01, f"Preparing {target} font (first time only)...")
+    font_dir, font_css = ensure_fonts(target)
+
+    # ---- 1. read every page (text extraction or AI vision)
+    reader = ReaderAgent(llm)
+    pages, notes = [], []
+    vision_ok = True  # after one failure, don't keep retrying vision on every page
+    for n, page in enumerate(doc):
+        progress(0.02 + 0.33 * n / total, f"Reading page {n + 1}/{total}...")
+        fonts = [f[3] for f in doc.get_page_fonts(n)]
+        mode, reason, required = choose_mode(page, fonts)
+        size = (page.rect.width, page.rect.height)
+        log.info(f"page {n + 1}: {mode} mode ({reason})")
+        t0 = time.time()
+        if mode == "skip":
+            continue
+        elements = None
+        if mode == "vision" and not vision_ok and not required:
+            notes.append(f"Page {n + 1}: {reason} - read directly (AI vision unavailable)")
+        elif mode == "vision":
+            progress(0.02 + 0.33 * n / total,
+                     f"Reader agent: reading page {n + 1}/{total} with AI vision ({reason})")
+            try:
+                elements = read_vision_page(page, reader)
+                notes.append(f"Page {n + 1}: {reason} - read with AI vision")
+            except Exception as e:
+                if required:  # scans/garbled text cannot be read any other way
+                    raise RuntimeError(f"page {n + 1} needs AI vision ({reason}), "
+                                       f"but it failed: {e}") from e
+                log.info(f"page {n + 1}: vision failed ({e}), reading text directly")
+                vision_ok = False
+                notes.append(f"Page {n + 1}: {reason} - AI vision was unavailable, "
+                             "so the text was read directly (layout may be simpler)")
+        if elements is None:
+            cpage = clean[n]
+            cpage.add_redact_annot(cpage.rect, fill=False)
+            cpage.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
+                                   graphics=fitz.PDF_REDACT_LINE_ART_NONE)
+            elements = read_text_page(page, cpage)
+        pages.append({"size": size, "elements": elements})
+        log.info(f"page {n + 1}: read in {time.time() - t0:.1f}s")
+
+    units = _units(pages)
+    if not units and not any(p["elements"] for p in pages):
+        raise ValueError("No text or pictures could be found in this PDF.")
+
+    # ---- 2. understand the document
+    if units:
+        progress(0.37, "Analyzer agent: understanding the document...")
+        sample = "\n".join(u["text"] for u in units)
+        brief = AnalyzerAgent(llm).run(sample, target)
+    else:
+        brief = {"genre": "pictures only", "tone": "", "audience": "", "summary": ""}
+        notes.append("No text was found, so the pictures were copied unchanged.")
+
+    # ---- 3. translate (+ review) in batches across the document
     translator, reviewer = TranslatorAgent(llm), ReviewerAgent(llm)
+    batches = list(_batches(units))
+    translations, context = {}, ""
+    for i, batch in enumerate(batches):
+        progress(0.4 + 0.5 * i / max(len(batches), 1),
+                 f"Translator agent: part {i + 1}/{len(batches)}")
+        result = translator.run(batch, target, brief, context)
+        missing = [u for u in batch if not result.get(u["id"], "").strip()]
+        if missing:  # ask once more for anything the model skipped
+            result.update(translator.run(missing, target, brief, context))
+        if review:
+            progress(0.4 + 0.5 * (i + 0.5) / max(len(batches), 1),
+                     f"Reviewer agent: polishing part {i + 1}/{len(batches)}")
+            result = reviewer.run(batch, result, target, brief)
+        translations.update(result)
+        context = "\n".join(result.get(u["id"], "") for u in batch)[-1500:]
 
-    context = ""
-    for n, (page, blocks) in enumerate(zip(doc, pages)):
-        blocks = [b for b in blocks if _worth_translating(b["text"])]
-        translations: dict = {}
-        for batch in _batches(blocks):
-            progress(0.08 + 0.9 * n / len(doc), f"Translator agent: page {n + 1}/{len(doc)}")
-            result = translator.run(batch, target, brief, context)
-            missing = [b for b in batch if not result.get(b["id"], "").strip()]
-            if missing:  # ask once more for anything the model skipped
-                result.update(translator.run(missing, target, brief, context))
-            if review:
-                progress(0.08 + 0.9 * (n + 0.5) / len(doc),
-                         f"Reviewer agent: polishing page {n + 1}/{len(doc)}")
-                result = reviewer.run(batch, result, target, brief)
-            translations.update(result)
-        write_page(page, blocks, translations, css, archive, rtl)
-        context = "\n".join(translations.get(b["id"], "") for b in blocks)[-1500:]
-
-    progress(0.99, "Packing the PDF...")
-    doc.subset_fonts(fallback=True)  # embed only the glyphs used (small file)
-    out = doc.tobytes(garbage=4, deflate=True)
+    # ---- 4. rebuild the PDF
+    progress(0.93, "Building the translated PDF...")
+    _apply(pages, translations)
+    rtl = LANGUAGES[target].get("rtl", False)
+    mixed = LANGUAGES[target]["font"] is not LATIN
+    out = build_pdf(pages, font_css, str(font_dir), rtl, mixed)
     doc.close()
+    clean.close()
+    log.info(f"TOTAL: {total} page(s) translated to {target} in {time.time() - started:.1f}s")
     progress(1.0, "Done")
-    return out, brief
-
-
-def render_preview(pdf_bytes: bytes, page_no: int = 0, dpi: int = 70) -> bytes:
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        page_no = min(page_no, len(doc) - 1)
-        return doc[page_no].get_pixmap(dpi=dpi).tobytes("png")
+    return out, brief, notes
