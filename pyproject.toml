@@ -1,0 +1,11 @@
+[project]
+name = "pdf-translator"
+version = "0.1.0"
+description = "Agentic PDF translator that keeps images in place"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.40",
+    "pymupdf>=1.25",
+    "openai>=1.50",
+    "fonttools>=4.50",
+]

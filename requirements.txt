@@ -1,0 +1,4 @@
+streamlit>=1.40
+pymupdf>=1.25
+openai>=1.50
+fonttools>=4.50
