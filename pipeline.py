@@ -4,13 +4,17 @@ from typing import Callable
 
 import pymupdf as fitz
 
-from agents import LLM, log, AnalyzerAgent, ReaderAgent, ReviewerAgent, TranslatorAgent
+from openai import BadRequestError
+
+from agents import LLM, QuotaExhausted, log, AnalyzerAgent, ReaderAgent, ReviewerAgent, TranslatorAgent
 from extract import choose_mode, read_text_page, read_vision_page
 from fonts import ensure_fonts
 from languages import LANGUAGES, LATIN
 from render import build_pdf
 
-MAX_CHARS_PER_CALL = 5000  # one request translates this much text (across pages)
+# one request translates this much text (across pages). Indian scripts need many
+# more output tokens than English, so bigger batches risk a cut-off answer.
+MAX_CHARS_PER_CALL = 3000
 
 
 def open_pdf(pdf_bytes: bytes, password: str = "") -> fitz.Document:
@@ -43,18 +47,6 @@ def _units(pages: list[dict]) -> list[dict]:
             elif el["kind"] != "image" and any(ch.isalpha() for ch in el["text"]):
                 units.append({"id": f"p{p}e{e}", "kind": el["kind"], "text": el["text"]})
     return units
-
-
-def _batches(units: list[dict]):
-    batch, size = [], 0
-    for u in units:
-        if batch and size + len(u["text"]) > MAX_CHARS_PER_CALL:
-            yield batch
-            batch, size = [], 0
-        batch.append(u)
-        size += len(u["text"])
-    if batch:
-        yield batch
 
 
 def _apply(pages: list[dict], translations: dict) -> None:
@@ -143,21 +135,40 @@ def translate_pdf(pdf_bytes: bytes, target: str, llm: LLM, review: bool = True,
 
     # ---- 3. translate (+ review) in batches across the document
     translator, reviewer = TranslatorAgent(llm), ReviewerAgent(llm)
-    batches = list(_batches(units))
     translations, context = {}, ""
-    for i, batch in enumerate(batches):
-        progress(0.4 + 0.5 * i / max(len(batches), 1),
-                 f"Translator agent: part {i + 1}/{len(batches)}")
-        result = translator.run(batch, target, brief, context)
-        missing = [u for u in batch if not result.get(u["id"], "").strip()]
-        if missing:  # ask once more for anything the model skipped
-            result.update(translator.run(missing, target, brief, context))
-        if review:
-            progress(0.4 + 0.5 * (i + 0.5) / max(len(batches), 1),
-                     f"Reviewer agent: polishing part {i + 1}/{len(batches)}")
+    limit, i, part = MAX_CHARS_PER_CALL, 0, 0
+    while i < len(units):
+        # take the next batch; `limit` shrinks if a model can't handle the size
+        batch, size = [], 0
+        for u in units[i:]:
+            if batch and size + len(u["text"]) > limit:
+                break
+            batch.append(u)
+            size += len(u["text"])
+        part += 1
+        progress(0.4 + 0.5 * i / len(units), f"Translator agent: part {part} "
+                 f"({min(i + len(batch), len(units))}/{len(units)} pieces of text)")
+        try:
+            result = translator.run(batch, target, brief, context)
+            missing = [u for u in batch if not result.get(u["id"], "").strip()]
+            if missing:  # ask once more for anything the model skipped
+                result.update(translator.run(missing, target, brief, context))
+        except QuotaExhausted:
+            raise
+        except (ValueError, BadRequestError) as e:
+            if len(batch) > 1:
+                limit = max(400, limit // 2)  # remember a smaller size for the rest of the job
+                log.info(f"part too big for the model ({e}); using {limit}-character parts")
+                continue
+            log.info(f"could not translate one piece ({e}); keeping the original text")
+            notes.append("A small part could not be translated and was kept in the original language.")
+            result = {}
+        if review and result:
+            progress(0.4 + 0.5 * (i + len(batch) / 2) / len(units), f"Reviewer agent: polishing part {part}")
             result = reviewer.run(batch, result, target, brief)
         translations.update(result)
         context = "\n".join(result.get(u["id"], "") for u in batch)[-1500:]
+        i += len(batch)
 
     # ---- 4. rebuild the PDF
     progress(0.93, "Building the translated PDF...")

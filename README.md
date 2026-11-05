@@ -42,16 +42,20 @@ so users know which pages (especially handwriting) to double-check.
 
 ## Which model, and why
 
-**Google Gemini 2.5 Flash (free tier) is the default.** It is one of the
+**Google Gemini (free tier) is the default.** It is one of the
 strongest models for Indian languages (Tamil, Malayalam, Hindi…) and for
 Japanese/Korean, it understands poetry and idioms, and the free tier needs no
-credit card. **Groq (Llama 3.3 70B)** is included as a free backup: very fast,
+credit card. **Groq** is included as a free backup: very fast,
 good for European languages, weaker for Tamil/Malayalam.
 
 Classic translation models (Google Translate API, NLLB, IndicTrans2) are word-
 and-sentence level; they can't keep a story's tone or a poem's rhythm. An LLM
 that first *understands* the document is what gives a meaningful result.
 
+> No model names are hard-coded: the app asks each provider which models exist
+> right now, picks the best, and switches automatically when one is retired or out
+> of free quota (each Gemini model has its own quota).
+>
 > Free tiers have limits (requests per minute/day) that providers change over
 > time. The app automatically waits and retries when limited. A ~20 page book
 > is fine; for very large books, switch the Reviewer off to halve requests.

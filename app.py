@@ -7,7 +7,7 @@ from agents import LLM, PROVIDERS
 from languages import LANGUAGES
 from pipeline import needs_password, translate_pdf
 
-LOGO = Path(__file__).parent / "assets" / "logo.jpg"
+LOGO = Path(__file__).parent / "assets" / "logo.png"
 ICON = str(LOGO) if LOGO.exists() else "🌐"  # browser tab icon
 
 st.set_page_config(page_title="PDF Translator Agent", page_icon=ICON,
